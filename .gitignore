@@ -14,6 +14,9 @@
 /assets/css/**/*.css
 /assets/vendor
 /config.php
+/.env
+/.env.local
+/.env.*.local
 /storage/backups/*
 !/storage/backups/.htaccess
 !/storage/backups/index.html
@@ -31,3 +34,4 @@
 /vendor/
 /metafile
 .DS_Store
+.atl/

@@ -1,0 +1,212 @@
+# =============================================================================
+# Easy!Appointments - Production Docker Compose
+# =============================================================================
+# Stack:
+#   - mysql           (BD de la app, solo en easyappointments_core)
+#   - php-fpm         (app PHP, en easyappointments_core + easyappointments_public)
+#
+# NO incluye:
+#   - nginx interno (lo maneja el nginx_proxy_manager del host, ya existente)
+#   - mailpit / phpmyadmin / phpldapadmin / swagger-ui / openldap / baikal
+#
+# Redes requeridas (crealas con `docker network create` antes de levantar):
+#   - easyappointments_core    (mysql + php-fpm)
+#   - easyappointments_public  (php-fpm + nginx_proxy_manager)
+# Ambas declaradas como `external: true` en este compose, asi que
+# NO se crean/borran automaticamente con `docker compose up/down`.
+# =============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: easyappointments_mysql
+    restart: unless-stopped
+    networks:
+      - easyappointments_core
+
+    # Credenciales leidas de .env (con defaults para dev local).
+    # En prod, MYSQL_ROOT_PASSWORD debe ser un secret fuerte.
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD es obligatorio}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-easyappointments}
+      MYSQL_USER: ${MYSQL_USER:-ea_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD es obligatorio}
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Init opcional: corre una vez en el primer arranque del volumen.
+      # Lo dejo commented porque la app corre migraciones automaticamente.
+      # - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+
+    # No expone puertos al host. Solo accesible desde easyappointments_core.
+    # Para admin, usar `docker exec -it easyappointments_mysql mysql -u root -p`.
+    expose:
+      - "3306"
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    # Limites conservadores; ajustables segun carga real.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  php-fpm:
+    build:
+      context: .
+      dockerfile: docker/php-fpm/Dockerfile
+    container_name: easyappointments_php
+    restart: unless-stopped
+    networks:
+      - easyappointments_core
+      - easyappointments_public
+
+    # El start-container (entrypoint) lee estas env vars y templa
+    # config.php + email.php antes de levantar php-fpm.
+    environment:
+      # === Identidad publica ===
+      APP_BASE_URL: ${APP_BASE_URL:-https://appointments.clinicadentaloctavio.com}
+      APP_LANGUAGE: ${APP_LANGUAGE:-spanish}
+      APP_DEBUG_MODE: ${APP_DEBUG_MODE:-false}
+      APP_ENV: ${APP_ENV:-production}
+
+      # === Base de datos (las inyecta en config.php) ===
+      # MYSQL_PASSWORD y MYSQL_ROOT_PASSWORD se re-exportan con su nombre
+      # original porque el start-container las lee con $MYSQL_PASSWORD
+      # y $MYSQL_ROOT_PASSWORD, no como DB_PASSWORD.
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${MYSQL_DATABASE:-easyappointments}
+      DB_USERNAME: ${MYSQL_USER:-ea_user}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD es obligatorio}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-easyappointments}
+      MYSQL_USER: ${MYSQL_USER:-ea_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD es obligatorio}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD es obligatorio}
+
+      # === Seguridad (inyectadas en config.php) ===
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY es obligatorio}
+      APP_TRUSTED_PROXY_IPS: ${APP_TRUSTED_PROXY_IPS:-}
+      APP_CORS_ALLOWED_ORIGINS: ${APP_CORS_ALLOWED_ORIGINS:-}
+
+      # === SMTP (inyectadas en email.php). Si quedan vacias,
+      #     email.php queda con protocol=mail (ssmtp) y no rompe la app. ===
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_CRYPTO: ${SMTP_CRYPTO:-tls}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Clinica Dental Octavio}
+      SMTP_FROM_ADDRESS: ${SMTP_FROM_ADDRESS:-}
+
+      # === ssmtp (relay local, fallback si SMTP_HOST vacio) ===
+      SSMTP_MAILHUB: ${SSMTP_MAILHUB:-mail:25}
+      SSMTP_USE_TLS: ${SSMTP_USE_TLS:-NO}
+      SSMTP_USE_STARTTLS: ${SSMTP_USE_STARTTLS:-NO}
+      SSMTP_AUTH_USER: ${SSMTP_AUTH_USER:-}
+      SSMTP_AUTH_PASS: ${SSMTP_AUTH_PASS:-}
+      SSMTP_HOSTNAME: ${SSMTP_HOSTNAME:-appointments.clinicadentaloctavio.com}
+
+    volumes:
+      # Codigo fuente: bind-mount en dev, en prod podes cambiar a imagen con
+      # COPY del codigo + volumen solo para storage (mas performante).
+      - .:/var/www/html
+      # Override de php.ini (sin xdebug en prod).
+      - ./docker/php-fpm/php-ini-overrides.ini:/usr/local/etc/php/conf.d/99-overrides.ini:ro
+      # storage persistente (separado del bind-mount para que sobreviva
+      # aunque se rebuilde la imagen).
+      - php_storage:/var/www/html/storage
+
+    # PHP-FPM escucha en :9000. nginx_proxy_manager (en easyappointments_public)
+    # resuelve "php-fpm" y forwarda ahi.
+    expose:
+      - "9000"
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+    # Sin limites agresivos: PHP-FPM puede pedir mas memoria bajo carga.
+    # Ajustar despues de medir.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # nginx interno de Easy!Appointments: adaptador HTTP<->FastCGI entre
+  # nginx_proxy_manager (host, en easyappointments_public) y php-fpm:9000.
+  # Solo escucha en easyappointments_public, NO expone puertos al host.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: easyappointments_nginx
+    restart: unless-stopped
+    networks:
+      - easyappointments_public
+    volumes:
+      # Codigo fuente: mismo bind-mount que php-fpm (mismo path /var/www/html).
+      - .:/var/www/html:ro
+      # Config de nginx. El archivo docker/nginx/nginx.conf define el
+      # server_name=appointments.clinicadentaloctavio.com y el fastcgi_pass
+      # a php-fpm:9000.
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+    depends_on:
+      - php-fpm
+
+    # Nginx es chico en memoria; php-fpm es el que traga.
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+        reservations:
+          memory: 16M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+networks:
+  easyappointments_core:
+    name: easyappointments_core
+    external: true
+  easyappointments_public:
+    name: easyappointments_public
+    external: true
+    # external: true => la red debe existir antes de `docker compose up`.
+    # Creala con:
+    #   docker network create easyappointments_public
+    # Y attachea nginx_proxy_manager a ella:
+    #   docker network connect easyappointments_public nginx_proxy_manager
+
+
+volumes:
+  mysql_data:
+    name: easyappointments_mysql_data
+  php_storage:
+    name: easyappointments_php_storage
